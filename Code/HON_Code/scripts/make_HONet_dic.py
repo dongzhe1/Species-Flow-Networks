@@ -18,7 +18,7 @@ import networkx as nx
 import itertools
 
 
-
+normalization = False
 
 ##########################################################
 #Writing down links for arcgis
@@ -40,7 +40,7 @@ def write_hon_links(HON_links,agg_risk,p_AdjList,ports):
             
             for dest,dest_risk in o_p_AdjList:
                 source=str(source);dest=str(dest)
-                if i<3000:    
+                if i<3000000:    
                     f.write(','.join(map(str, [source,dest,dest_risk,
                                                     ports[source]['NAME'],ports[dest]['NAME'],
                                                      ports[source]['LATITUDE_DECIMAL'],ports[source]['LONGITUDE_DECIMAL'],
@@ -286,7 +286,10 @@ def normalize_network(AdjList,max_val):
     for source,incomings in AdjList.items():
         #sum_source=sum(incomings.values())
         for target, val in incomings.items():
-            normalized_AdjList[source][target]=val/max_val
+            if normalization:
+                normalized_AdjList[source][target]=val/max_val
+            else:
+                normalized_AdjList[source][target]=val
     return normalized_AdjList
 def get_max_val_in_adjM(adjlist):
     vals=[]
@@ -307,8 +310,6 @@ def build_shipping_net_and_port_risk(hon_alg_output,write,net_file,agg_risk_file
     p_AdjList=list_sum_dic(p_AdjList)
     max_val=get_max_val_in_adjM(p_AdjList)
     print('max_val: ',max_val)
-    #max_val=5.718045873213033e-05
-    max_val=36.510086825975364
     p_AdjList_norm=normalize_network(p_AdjList,max_val)
     #print(len(p_AdjList_norm[1640]))
     agg_port_risk=risk_aggregator(p_AdjList_norm)
