@@ -438,7 +438,7 @@ def main():
             portToCountry[row['Port_id']] = row
 
     us_ports = {pid for pid, info in portToCountry.items()
-                if info.get('Country_name') == 'United States'}
+                if info.get('Country_name') == 'U.S.A.'}
     print(f"  US ports identified: {len(us_ports)}")
 
     exportDict = {}
