@@ -1,18 +1,27 @@
 """
-Sensitivity Analysis — Single-threaded version
-===============================================
-Same logic as sensitivity_analysis.py but without multiprocessing.
-Use this if the parallel version causes issues on your system,
-or for debugging / small N_SIMULATIONS test runs.
+Sensitivity Analysis — Biofouling model parameters
+====================================================
+Mirrors the structure of bw_sensitivity_analysis.py but targets the
+continuous parameters of the biofouling P(NIS) model rather than
+ballast discharge volumes.
 
-Parameters (edit in CONFIG section below):
-    SIGMA_VALUES     : perturbation magnitudes (e.g. [0.2, 0.5])
-    N_SIMULATIONS    : number of Monte Carlo iterations
-    RUN_BALLAST      : whether to run ballast sensitivity analysis
-    RUN_FOULING      : whether to run fouling analysis
-    STAY_ATTENUATION : bool, corresponds to 'stayAttenuation' in original code
-    TRADE_ADJUST     : bool, corresponds to 'tradeAdjust' in original code
-    TOP_N            : number of top countries for stability reporting
+Two analyses are run:
+
+1. MONTE CARLO PARAMETER PERTURBATION
+   Each continuous parameter is independently perturbed each iteration:
+       param_i ~ param_i_base * max(Normal(1.0, sigma), 0)
+   Parameters perturbed:
+       P(intro)  : lambda_, aT1, aT2, aT3, aE1, aE2, aE3
+       P(estab)  : beta, delta_T, delta_S
+
+2. LATITUDE THRESHOLD SCENARIO ANALYSIS
+   Fixed parameters, tropical/temperate boundary set to:
+       baseline  : 0.35 rad  (~20 deg)
+       scenario A: 15 deg converted to radians
+       scenario B: 25 deg converted to radians
+   Each scenario is a single deterministic run (no Monte Carlo).
+
+CONFIG section below controls all key settings.
 """
 
 import csv
@@ -29,36 +38,49 @@ getcontext().prec = 50
 # ============================================================
 # CONFIG — edit these parameters
 # ============================================================
-SIGMA_VALUES     = [0.2]   # perturbation magnitudes to test
-N_SIMULATIONS    = 100            # Monte Carlo iterations (set low for testing)
-RUN_BALLAST      = True          # run ballast Monte Carlo sensitivity analysis
-RUN_FOULING      = False          # run fouling analysis (invariant to ballast
-                                 # discharge perturbation — set True only if
-                                 # a different perturbation target is added)
-STAY_ATTENUATION = False         # 'stayAttenuation' in original code
-TRADE_ADJUST     = False         # 'tradeAdjust' in original code
-TOP_N            = 10            # top-N countries for stability metric
+SIGMA_VALUES     = [0.2, 0.4]    # perturbation magnitudes to test
+N_SIMULATIONS    = 100           # Monte Carlo iterations per sigma
+STAY_ATTENUATION = False          # 'stayAttenuation' in original code
+TRADE_ADJUST     = False          # 'tradeAdjust' in original code
+TOP_N            = 10             # top-N countries for stability metric
 SEED             = 42
 
-# Fixed model parameters (do not change — must match original)
+# Latitude threshold scenarios (degrees -> radians)
+# Baseline is 0.35 rad; scenarios A and B override this value
+LAT_THRESHOLD_BASE = 0.35                      # ~20 deg, original value
+LAT_THRESHOLD_15   = 15.0 * math.pi / 180.0   # 0.2618 rad
+LAT_THRESHOLD_25   = 25.0 * math.pi / 180.0   # 0.4363 rad
+
+# Fixed baseline model parameters
+BASE_LAMBDA = 0.008          # speed decay rate in P(intro)
+BASE_AT1    = 1.29e-7        # tropical cubic coefficient
+BASE_AT2    = 8.316e-5       # tropical quadratic coefficient
+BASE_AT3    = 0.01495187     # tropical linear coefficient
+BASE_AE1    = 1.4e-9         # temperate cubic coefficient
+BASE_AE2    = 1.6566e-5      # temperate quadratic coefficient
+BASE_AE3    = 5.19377e-3     # temperate linear coefficient
+BASE_BETA   = 0.00015        # establishment base probability
+BASE_DELTA_T = 2.0           # temperature tolerance std (deg C)
+BASE_DELTA_S = 10.0          # salinity tolerance std (ppt)
+
+# Fixed structural settings
 ORDER       = 16
 R           = 'r0'
 ENV         = 'env_'
 ECO         = 'Eco_'
 MIN_SUPPORT = 1e-20
-B_EFFICACY  = {'r0': 0, 'r1': 0.7661, 'r2': 0.99150495, 'r3': 0.999371131}
 
 # File paths — adjust to your environment
-BASE                 = '../../data/'
-clean_move           = BASE + 'moves/moves_cleaned_2018.txt'
-port_data_file       = BASE + 'Places_allportdata_mergedSept2017.csv'
-stay_file            = BASE + 'stay/stay.csv'
-port_to_country_file = BASE + 'stay/portToCountry.csv'
-export_file          = BASE + 'trade/Export_change_for_BW.csv'
-import_file          = BASE + 'trade/Import_change_for_fouling.csv'
+BASE_DIR             = '../../data/'
+clean_move           = BASE_DIR + 'moves/moves_cleaned_2018.txt'
+port_data_file       = BASE_DIR + 'Places_allportdata_mergedSept2017.csv'
+stay_file            = BASE_DIR + 'stay/stay.csv'
+port_to_country_file = BASE_DIR + 'stay/portToCountry.csv'
+export_file          = BASE_DIR + 'trade/Export_change_for_BW.csv'
+import_file          = BASE_DIR + 'trade/Import_change_for_fouling.csv'
 
 # ============================================================
-# UTILITY FUNCTIONS  (from 02, logic unchanged)
+# UTILITY FUNCTIONS  (from 02_Prepare_HON_Input, logic unchanged)
 # ============================================================
 
 def get_port_data(fn, field, delim):
@@ -80,8 +102,9 @@ def get_distance_km(ports, source, dest):
     R    = 6371
     dLat = deg2rad(lat2 - lat1)
     dLon = deg2rad(lon2 - lon1)
-    a    = (math.sin(dLat/2)**2
-            + math.cos(deg2rad(lat1)) * math.cos(deg2rad(lat2)) * math.sin(dLon/2)**2)
+    a    = (math.sin(dLat / 2) ** 2
+            + math.cos(deg2rad(lat1)) * math.cos(deg2rad(lat2))
+            * math.sin(dLon / 2) ** 2)
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 def filterbyeco(ports, source, dest):
@@ -115,41 +138,55 @@ def filterbyeco_same_only(ports, source, dest):
     except:
         return -1
 
-def establishment(ports, source, dest):
+def establishment(ports, source, dest,
+                  beta=BASE_BETA,
+                  delta_T=BASE_DELTA_T,
+                  delta_S=BASE_DELTA_S):
+    """P(estab) with optionally perturbed parameters."""
     try:
-        sal_diff  = abs(float(ports[source]['Salinity'])  - float(ports[dest]['Salinity']))
-        temp_diff = abs(float(ports[source]['YR_MEAN_T']) - float(ports[dest]['YR_MEAN_T']))
-        return 0.00015 * math.exp(-0.5 * ((temp_diff/2)**2 + (sal_diff/10)**2))
+        sal_diff  = abs(float(ports[source]['Salinity'])
+                        - float(ports[dest]['Salinity']))
+        temp_diff = abs(float(ports[source]['YR_MEAN_T'])
+                        - float(ports[dest]['YR_MEAN_T']))
+        return beta * math.exp(
+            -0.5 * ((temp_diff / delta_T) ** 2 + (sal_diff / delta_S) ** 2)
+        )
     except:
         return -1
 
 def fouling_risk(ports, source, stay_d, distance, trip_duration,
-                 antifouling_p, portToCountry, countryStayRatio):
+                 antifouling_p, portToCountry, countryStayRatio,
+                 lambda_=BASE_LAMBDA,
+                 aT1=BASE_AT1, aT2=BASE_AT2, aT3=BASE_AT3,
+                 aE1=BASE_AE1, aE2=BASE_AE2, aE3=BASE_AE3,
+                 lat_threshold=LAT_THRESHOLD_BASE):
+    """P(intro) with optionally perturbed parameters."""
     if STAY_ATTENUATION and source in portToCountry:
         ratio  = countryStayRatio.get(portToCountry[source]['Country_name'], 1)
         stay_d = stay_d * ratio
     v = distance / trip_duration
-    if abs(float(ports[source]['LATITUDE_DECIMAL'])) < 0.35:
-        f = (0.000000129*stay_d**3 - 0.000083165*stay_d**2
-             + 0.01495187*stay_d) * antifouling_p * math.exp(-0.008*v)
+    if abs(float(ports[source]['LATITUDE_DECIMAL'])) < lat_threshold:
+        # tropical
+        f = ((aT1 * stay_d ** 3 - aT2 * stay_d ** 2 + aT3 * stay_d)
+             * antifouling_p * math.exp(-lambda_ * v))
     else:
-        f = (0.0000000014*stay_d**3 - 0.000016566*stay_d**2
-             + 0.00519377*stay_d) * antifouling_p * math.exp(-0.008*v)
+        # temperate
+        f = ((aE1 * stay_d ** 3 - aE2 * stay_d ** 2 + aE3 * stay_d)
+             * antifouling_p * math.exp(-lambda_ * v))
     return f
 
-def adjust_trade_prob(source, dest, vessel_type, orig_prob, t,
+def adjust_trade_prob(source, dest, vessel_type, orig_prob,
                       portToCountry, exportDict, importDict):
     if orig_prob == 0 or not TRADE_ADJUST:
         return orig_prob
-    trade_dict = importDict if t == 'fouling' else exportDict
     src_c = portToCountry[source]['Country_name']
     dst_c = portToCountry[dest]['Country_name']
-    if src_c not in trade_dict:
+    if src_c not in importDict:
         src_c = 'Rest of the World'
-    elif dst_c not in trade_dict:
+    elif dst_c not in importDict:
         dst_c = 'Rest of the World'
     try:
-        ratio = Decimal(trade_dict[src_c][dst_c].get(vessel_type, 1))
+        ratio = Decimal(importDict[src_c][dst_c].get(vessel_type, 1))
     except:
         ratio = 1
     orig_prob = Decimal(orig_prob)
@@ -163,7 +200,8 @@ def is_valid_month(pair):
             and first_sail_year != '' and second_arrival_year != ''):
         if first['PLACE ID'] != second['PLACE ID']:
             valid_cross = (first_sail_year in
-                           ('1997','1999','2002','2005','2008','2012','2015','2018')
+                           ('1997', '1999', '2002', '2005',
+                            '2008', '2012', '2015', '2018')
                            and int(second_arrival_year) == int(first_sail_year) + 1)
             if first_sail_year == second_arrival_year or valid_cross:
                 try:
@@ -176,7 +214,7 @@ def is_valid_month(pair):
     return False, -1, -1
 
 # ============================================================
-# HON FUNCTIONS  (from 03, logic unchanged — no file I/O)
+# HON FUNCTIONS  (from 03_Build-SF-HON, logic unchanged)
 # ============================================================
 
 def _kld(d1, d2):
@@ -197,7 +235,7 @@ def build_hon_in_memory(trajectory_list, max_order=ORDER, min_support=MIN_SUPPOR
         source = tuple(traj[:-1])
         Distribution[source][target].append(prob)
 
-    # Aggragate_Probs
+    # Aggregate_Probs
     final_dist = defaultdict(dict)
     for source, targets in Distribution.items():
         for target, vals in targets.items():
@@ -281,7 +319,7 @@ def build_hon_in_memory(trajectory_list, max_order=ORDER, min_support=MIN_SUPPOR
     return Graph
 
 # ============================================================
-# RISK AGGREGATION  (from 04, logic unchanged)
+# RISK AGGREGATION  (from 04_make_HONet_dict, logic unchanged)
 # ============================================================
 
 def compute_port_agg_risks(Graph):
@@ -323,64 +361,80 @@ def build_country_risks_from_items(items, portToCountry):
     return agg_to_country(port_risks, portToCountry)
 
 # ============================================================
-# PIPELINE — returns (ballast_risks or None, fouling_risks or None)
+# PIPELINE
 # ============================================================
 
-def run_pipeline(probs_raw, sigma, rng,
-                 ports, portToCountry, countryStayRatio,
-                 exportDict, importDict):
+def run_pipeline(probs_raw, ports, portToCountry, countryStayRatio,
+                 exportDict, importDict,
+                 rng=None, sigma=0.0,
+                 lat_threshold=LAT_THRESHOLD_BASE):
     """
-    One full pipeline iteration.
-    Respects RUN_BALLAST and RUN_FOULING switches.
-    sigma = 0.0 -> baseline (no perturbation).
-    Returns (ballast_country_risks, fouling_country_risks),
-    either of which may be None if the corresponding switch is off.
+    One full fouling pipeline iteration.
+
+    If sigma > 0 and rng is provided, each continuous parameter is
+    independently perturbed:
+        param_i = param_i_base * max(Normal(1.0, sigma), 0)
+
+    If sigma == 0, baseline parameters are used (deterministic).
+    lat_threshold controls the tropical/temperate boundary.
+
+    Returns: country_risks dict
     """
-    ballast_items = [] if RUN_BALLAST else None
-    fouling_items = [] if RUN_FOULING else None
+    # Sample perturbed parameters (or use baseline)
+    def _p(base):
+        if sigma > 0 and rng is not None:
+            return base * max(float(rng.normal(1.0, sigma)), 0.0)
+        return base
+
+    lambda_ = _p(BASE_LAMBDA)
+    aT1     = _p(BASE_AT1)
+    aT2     = _p(BASE_AT2)
+    aT3     = _p(BASE_AT3)
+    aE1     = _p(BASE_AE1)
+    aE2     = _p(BASE_AE2)
+    aE3     = _p(BASE_AE3)
+    beta    = _p(BASE_BETA)
+    delta_T = _p(BASE_DELTA_T)
+    delta_S = _p(BASE_DELTA_S)
+
+    fouling_items = []
 
     for pair, move_list in probs_raw.items():
         source, dest = pair
+
+        p_alien = move_list[0]['_p_alien']  # precomputed, structural — not perturbed
+
+        # P(estab) — re-computed with perturbed beta / delta_T / delta_S
+        p_estab = establishment(ports, source, dest,
+                                beta=beta,
+                                delta_T=delta_T,
+                                delta_S=delta_S)
+        if p_estab == -1:
+            continue
+
         for move in move_list:
-            if move['_p_estab'] == -1:
-                continue
-            p_alien = move['_p_alien']
-            p_estab = move['_p_estab']
+            p_f = fouling_risk(
+                ports, source,
+                move['stay_duration'],
+                move['distance'],
+                move['trip_duration'],
+                move['antifouling_p'],
+                portToCountry, countryStayRatio,
+                lambda_=lambda_,
+                aT1=aT1, aT2=aT2, aT3=aT3,
+                aE1=aE1, aE2=aE2, aE3=aE3,
+                lat_threshold=lat_threshold,
+            )
+            prob_f = p_alien * p_f * p_estab
+            prob_f = adjust_trade_prob(source, dest, move['vessel_type'],
+                                       prob_f, portToCountry,
+                                       exportDict, importDict)
+            fouling_items.append((prob_f, move['subseq']))
 
-            # ---- BALLAST ----
-            if RUN_BALLAST:
-                bw = move['ballast_discharge']
-                if sigma > 0 and not move['is_us_source']:
-                    noise = rng.normal(1.0, sigma)
-                    bw    = bw * max(noise, 0.0)
-                bd      = 1 - math.exp(-3.22e-6 * bw)
-                p_intro = (1 - B_EFFICACY[R]) * bd * math.exp(-0.02 * move['trip_duration'])
-                prob_b  = p_alien * p_intro * p_estab
-                prob_b  = adjust_trade_prob(source, dest, move['vessel_type'],
-                                            prob_b, 'ballast',
-                                            portToCountry, exportDict, importDict)
-                ballast_items.append((prob_b, move['subseq']))
-
-            # ---- FOULING ---- (no perturbation — does not use ballast discharge)
-            if RUN_FOULING:
-                p_f    = fouling_risk(ports, source,
-                                      move['stay_duration'], move['distance'],
-                                      move['trip_duration'], move['antifouling_p'],
-                                      portToCountry, countryStayRatio)
-                prob_f = p_alien * p_f * p_estab
-                prob_f = adjust_trade_prob(source, dest, move['vessel_type'],
-                                           prob_f, 'fouling',
-                                           portToCountry, exportDict, importDict)
-                fouling_items.append((prob_f, move['subseq']))
-
-    ballast_risks = (build_country_risks_from_items(ballast_items, portToCountry)
-                     if RUN_BALLAST else None)
-    fouling_risks = (build_country_risks_from_items(fouling_items, portToCountry)
-                     if RUN_FOULING else None)
-    return ballast_risks, fouling_risks
+    return build_country_risks_from_items(fouling_items, portToCountry)
 
 # ============================================================
-# STABILITY METRICS
+# STABILITY METRICS  (same as bw_sensitivity_analysis.py)
 # ============================================================
 
 def make_baseline_info(country_risks):
@@ -389,7 +443,7 @@ def make_baseline_info(country_risks):
     values    = np.array([country_risks.get(c, 0.0) for c in countries])
     order     = values.argsort()[::-1]
     top_n     = set(np.array(countries)[order[:TOP_N]])
-    topQ      = set(np.array(countries)[order[:n//4]])
+    topQ      = set(np.array(countries)[order[:n // 4]])
     return countries, n, values, top_n, topQ
 
 def compute_metrics(baseline_values, sim_values, all_countries,
@@ -398,7 +452,7 @@ def compute_metrics(baseline_values, sim_values, all_countries,
     sim_order  = sim_values.argsort()[::-1]
     countries  = np.array(all_countries)
     top_n_sim  = set(countries[sim_order[:TOP_N]])
-    topQ_sim   = set(countries[sim_order[:n_countries//4]])
+    topQ_sim   = set(countries[sim_order[:n_countries // 4]])
     top_n_pct  = len(top_n_baseline & top_n_sim) / TOP_N * 100
     topQ_pct   = len(topQ_baseline  & topQ_sim)  / len(topQ_baseline) * 100
     return corr, top_n_pct, topQ_pct
@@ -409,19 +463,17 @@ def compute_metrics(baseline_values, sim_values, all_countries,
 
 def main():
     print("=" * 60)
-    print("Sensitivity Analysis — Single-threaded version")
+    print("Sensitivity Analysis — Biofouling model parameters")
     print("=" * 60)
     print(f"sigma values:     {SIGMA_VALUES}")
     print(f"N simulations:    {N_SIMULATIONS}")
-    print(f"RUN_BALLAST:      {RUN_BALLAST}")
-    print(f"RUN_FOULING:      {RUN_FOULING}")
     print(f"stayAttenuation:  {STAY_ATTENUATION}")
     print(f"tradeAdjust:      {TRADE_ADJUST}")
+    print(f"Lat threshold (baseline): {LAT_THRESHOLD_BASE:.4f} rad"
+          f"  (~{math.degrees(LAT_THRESHOLD_BASE):.1f} deg)")
+    print(f"Lat threshold (15 deg):   {LAT_THRESHOLD_15:.4f} rad")
+    print(f"Lat threshold (25 deg):   {LAT_THRESHOLD_25:.4f} rad")
     print()
-
-    if not RUN_BALLAST and not RUN_FOULING:
-        print("Both RUN_BALLAST and RUN_FOULING are False — nothing to do.")
-        return
 
     # ---- Load static data (once) ----
     print("Loading port data...")
@@ -436,10 +488,6 @@ def main():
     with open(port_to_country_file) as f:
         for row in csv.DictReader(f):
             portToCountry[row['Port_id']] = row
-
-    us_ports = {pid for pid, info in portToCountry.items()
-                if info.get('Country_name') == 'U.S.A.'}
-    print(f"  US ports identified: {len(us_ports)}")
 
     exportDict = {}
     importDict = {}
@@ -457,8 +505,8 @@ def main():
     # ---- Load moves & build ProbsRaw (once) ----
     print("Loading moves...")
     moves       = []
-    VALID_TYPES = {'Auto','Container','Bulk','Tanker','Chemical',
-                   'Oil','General','Liquified-Gas','Refrigerated-Cargo'}
+    VALID_TYPES = {'Auto', 'Container', 'Bulk', 'Tanker', 'Chemical',
+                   'Oil', 'General', 'Liquified-Gas', 'Refrigerated-Cargo'}
     with open(clean_move) as f:
         reader = csv.DictReader(f, delimiter='|')
         for row in reader:
@@ -501,14 +549,12 @@ def main():
                 if pair not in probs_raw:
                     probs_raw[pair] = []
                 probs_raw[pair].append({
-                    'trip_duration':    float(trip_dur),
-                    'stay_duration':    float(stay_dur),
-                    'ballast_discharge':float(prev_move['BALLAST DISCHARGE']),
-                    'antifouling_p':    float(prev_move['ANTIFOULING PROB']),
-                    'distance':         float(distance),
-                    'subseq':           subseq,
-                    'vessel_type':      prev_move['VESSEL TYPE'],
-                    'is_us_source':     source in us_ports,
+                    'trip_duration':  float(trip_dur),
+                    'stay_duration':  float(stay_dur),
+                    'antifouling_p':  float(prev_move['ANTIFOULING PROB']),
+                    'distance':       float(distance),
+                    'subseq':         subseq,
+                    'vessel_type':    prev_move['VESSEL TYPE'],
                 })
             except:
                 pass
@@ -517,105 +563,127 @@ def main():
 
     print(f"  ProbsRaw built: {len(probs_raw)} port pairs")
 
-    # ---- Precompute static p_alien and p_estab ----
-    print("Precomputing static probabilities (p_alien, p_estab)...")
+    # ---- Precompute p_alien (structural, never perturbed) ----
+    print("Precomputing p_alien (structural)...")
     for pair, move_list in probs_raw.items():
         source, dest = pair
         p_alien = (1 if ECO == 'noEco_'
                    else filterbyeco_same_only(ports, source, dest) if ECO == 'sameEco_'
                    else filterbyeco(ports, source, dest))
-        p_estab = 1 if ENV == 'noEnv_' else establishment(ports, source, dest)
         for move in move_list:
             move['_p_alien'] = p_alien
-            move['_p_estab'] = p_estab
     print("  Done.")
 
-    # ---- Baseline run (sigma=0) ----
-    print("\nComputing baseline (sigma=0)...")
-    base_b, base_f = run_pipeline(
-        probs_raw, sigma=0.0, rng=None,
-        ports=ports, portToCountry=portToCountry,
-        countryStayRatio=countryStayRatio,
-        exportDict=exportDict, importDict=importDict)
+    # ============================================================
+    # PART 1 — MONTE CARLO PARAMETER PERTURBATION
+    # ============================================================
+    print("\n" + "=" * 60)
+    print("PART 1 — Monte Carlo parameter perturbation")
+    print("=" * 60)
 
-    if RUN_BALLAST:
-        b_countries, b_n, b_values, b_top_n, b_topQ = make_baseline_info(base_b)
-        print(f"  Ballast — countries: {b_n}, top-{TOP_N}: {sorted(b_top_n)}")
-    if RUN_FOULING:
-        f_countries, f_n, f_values, f_top_n, f_topQ = make_baseline_info(base_f)
-        print(f"  Fouling — countries: {f_n}, top-{TOP_N}: {sorted(f_top_n)}")
+    print("\nComputing baseline (sigma=0, lat_threshold=baseline)...")
+    base_risks = run_pipeline(
+        probs_raw, ports, portToCountry, countryStayRatio,
+        exportDict, importDict,
+        rng=None, sigma=0.0,
+        lat_threshold=LAT_THRESHOLD_BASE,
+    )
+    countries, n_c, base_values, base_top_n, base_topQ = make_baseline_info(base_risks)
+    print(f"  Countries: {n_c}, top-{TOP_N}: {sorted(base_top_n)}")
 
-    # ---- Monte Carlo ----
-    all_results = {}
-
+    mc_results = {}
     for sigma in SIGMA_VALUES:
         print(f"\nMonte Carlo: sigma={sigma}, N={N_SIMULATIONS} ...")
         rng = np.random.RandomState(SEED)
-
-        b_corr, b_top_n_pct, b_topQ_pct = [], [], []
-        f_corr, f_top_n_pct, f_topQ_pct = [], [], []
+        corr_list, top_n_list, topQ_list = [], [], []
 
         for i in range(N_SIMULATIONS):
             if (i + 1) % 10 == 0:
                 print(f"  {i+1}/{N_SIMULATIONS}")
+            sim_risks = run_pipeline(
+                probs_raw, ports, portToCountry, countryStayRatio,
+                exportDict, importDict,
+                rng=rng, sigma=sigma,
+                lat_threshold=LAT_THRESHOLD_BASE,
+            )
+            sim_vals = np.array([sim_risks.get(c, 0.0) for c in countries])
+            corr, tn, tq = compute_metrics(base_values, sim_vals, countries,
+                                           base_top_n, base_topQ, n_c)
+            corr_list.append(corr)
+            top_n_list.append(tn)
+            topQ_list.append(tq)
 
-            sim_b, sim_f = run_pipeline(
-                probs_raw, sigma=sigma, rng=rng,
-                ports=ports, portToCountry=portToCountry,
-                countryStayRatio=countryStayRatio,
-                exportDict=exportDict, importDict=importDict)
+        mc_results[sigma] = {
+            'corr_mean':  np.mean(corr_list),
+            'corr_std':   np.std(corr_list),
+            'corr_min':   np.min(corr_list),
+            'top_n_mean': np.mean(top_n_list),
+            'top_n_min':  np.min(top_n_list),
+            'topQ_mean':  np.mean(topQ_list),
+            'topQ_min':   np.min(topQ_list),
+        }
 
-            if RUN_BALLAST:
-                sim_b_vals = np.array([sim_b.get(c, 0.0) for c in b_countries])
-                c, tn, tq  = compute_metrics(b_values, sim_b_vals, b_countries,
-                                             b_top_n, b_topQ, b_n)
-                b_corr.append(c); b_top_n_pct.append(tn); b_topQ_pct.append(tq)
-
-            if RUN_FOULING:
-                sim_f_vals = np.array([sim_f.get(c, 0.0) for c in f_countries])
-                c, tn, tq  = compute_metrics(f_values, sim_f_vals, f_countries,
-                                             f_top_n, f_topQ, f_n)
-                f_corr.append(c); f_top_n_pct.append(tn); f_topQ_pct.append(tq)
-
-        all_results[sigma] = {}
-        if RUN_BALLAST:
-            all_results[sigma]['ballast'] = {
-                'corr_mean':  np.mean(b_corr),
-                'corr_std':   np.std(b_corr),
-                'corr_min':   np.min(b_corr),
-                'top_n_mean': np.mean(b_top_n_pct),
-                'top_n_min':  np.min(b_top_n_pct),
-                'topQ_mean':  np.mean(b_topQ_pct),
-                'topQ_min':   np.min(b_topQ_pct),
-            }
-        if RUN_FOULING:
-            all_results[sigma]['fouling'] = {
-                'corr_mean':  np.mean(f_corr),
-                'corr_std':   np.std(f_corr),
-                'corr_min':   np.min(f_corr),
-                'top_n_mean': np.mean(f_top_n_pct),
-                'top_n_min':  np.min(f_top_n_pct),
-                'topQ_mean':  np.mean(f_topQ_pct),
-                'topQ_min':   np.min(f_topQ_pct),
-            }
-
-    # ---- Print results ----
+    # ============================================================
+    # PART 2 — LATITUDE THRESHOLD SCENARIO ANALYSIS
+    # ============================================================
     print("\n" + "=" * 60)
-    print("RESULTS")
+    print("PART 2 — Latitude threshold scenario analysis")
+    print("(fixed parameters, baseline sigma=0)")
     print("=" * 60)
-    for sigma, res in all_results.items():
-        print(f"\n  sigma = {sigma}  (+-{int(sigma*100)}% perturbation on non-US ballast discharge)")
-        for label, key in [('Ballast', 'ballast'), ('Fouling', 'fouling')]:
-            if key not in res:
-                continue
-            r = res[key]
-            print(f"\n  [{label}]")
-            print(f"    Spearman:          {r['corr_mean']:.4f} +- {r['corr_std']:.4f}"
-                  f"  (min = {r['corr_min']:.4f})")
-            print(f"    Top-{TOP_N} stability: {r['top_n_mean']:.1f}% mean"
-                  f"  (min = {r['top_n_min']:.1f}%)")
-            print(f"    Top-Q stability:   {r['topQ_mean']:.1f}% mean"
-                  f"  (min = {r['topQ_min']:.1f}%)")
+
+    scenario_results = {}
+    for label, threshold in [
+        ('15 deg', LAT_THRESHOLD_15),
+        ('25 deg', LAT_THRESHOLD_25),
+    ]:
+        print(f"\nScenario: lat_threshold = {label} ({threshold:.4f} rad)...")
+        scen_risks = run_pipeline(
+            probs_raw, ports, portToCountry, countryStayRatio,
+            exportDict, importDict,
+            rng=None, sigma=0.0,
+            lat_threshold=threshold,
+        )
+        scen_vals = np.array([scen_risks.get(c, 0.0) for c in countries])
+        corr, tn, tq = compute_metrics(base_values, scen_vals, countries,
+                                       base_top_n, base_topQ, n_c)
+        scen_order   = scen_vals.argsort()[::-1]
+        scen_top_n   = list(np.array(countries)[scen_order[:TOP_N]])
+        scenario_results[label] = {
+            'corr':       corr,
+            'top_n_pct':  tn,
+            'topQ_pct':   tq,
+            'top_n_list': scen_top_n,
+        }
+
+    # ============================================================
+    # PRINT RESULTS
+    # ============================================================
+    print("\n" + "=" * 60)
+    print("RESULTS — PART 1: Monte Carlo parameter perturbation")
+    print("=" * 60)
+    print(f"  Baseline top-{TOP_N}: {sorted(base_top_n)}\n")
+    for sigma, r in mc_results.items():
+        print(f"  sigma = {sigma}  (+-{int(sigma*100)}% independent perturbation"
+              f" on each continuous parameter)")
+        print(f"    Spearman:          {r['corr_mean']:.4f} +- {r['corr_std']:.4f}"
+              f"  (min = {r['corr_min']:.4f})")
+        print(f"    Top-{TOP_N} stability: {r['top_n_mean']:.1f}% mean"
+              f"  (min = {r['top_n_min']:.1f}%)")
+        print(f"    Top-Q stability:   {r['topQ_mean']:.1f}% mean"
+              f"  (min = {r['topQ_min']:.1f}%)")
+        print()
+
+    print("=" * 60)
+    print("RESULTS — PART 2: Latitude threshold scenarios")
+    print("=" * 60)
+    print(f"  Baseline (~20 deg) top-{TOP_N}: {sorted(base_top_n)}\n")
+    for label, r in scenario_results.items():
+        print(f"  Scenario: {label}")
+        print(f"    Spearman vs baseline:  {r['corr']:.4f}")
+        print(f"    Top-{TOP_N} overlap:       {r['top_n_pct']:.1f}%")
+        print(f"    Top-Q overlap:         {r['topQ_pct']:.1f}%")
+        print(f"    Top-{TOP_N} countries:     {r['top_n_list']}")
+        print()
 
 
 if __name__ == '__main__':
