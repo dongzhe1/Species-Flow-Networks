@@ -1,32 +1,48 @@
 """
 Sensitivity Analysis — Biofouling model parameters
 ====================================================
-Mirrors the structure of bw_sensitivity_analysis.py but targets the
-continuous parameters of the biofouling P(NIS) model rather than
-ballast discharge volumes.
+Mirrors the structure of ballast_water.py but targets the continuous
+parameters of the biofouling P(NIS) model.
 
-Two analyses are run:
+Two analyses are run, each evaluated at three levels:
+  A) Country-level  : 32 BRI countries only
+  B) Pair-level (global) : all country pairs
+  C) Pair-level (BRI)    : pairs where BOTH countries are BRI members
 
-1. MONTE CARLO PARAMETER PERTURBATION
-   Each continuous parameter is independently perturbed each iteration:
-       param_i ~ param_i_base * max(Normal(1.0, sigma), 0)
-   Parameters perturbed:
-       P(intro)  : lambda_, aT1, aT2, aT3, aE1, aE2, aE3
-       P(estab)  : beta, delta_T, delta_S
+Analysis 1 — MONTE CARLO PARAMETER PERTURBATION
+  Each continuous parameter is independently perturbed each iteration:
+      param_i ~ param_i_base * max(Normal(1.0, sigma), 0)
+  Parameters perturbed:
+      P(intro)  : lambda_, aT1, aT2, aT3, aE1, aE2, aE3
+      P(estab)  : beta, delta_T, delta_S
 
-2. LATITUDE THRESHOLD SCENARIO ANALYSIS
-   Fixed parameters, tropical/temperate boundary set to:
-       baseline  : 0.35 rad  (~20 deg)
-       scenario A: 15 deg converted to radians
-       scenario B: 25 deg converted to radians
-   Each scenario is a single deterministic run (no Monte Carlo).
+Analysis 2 — LATITUDE THRESHOLD SCENARIO ANALYSIS
+  Fixed parameters, tropical/temperate boundary set to:
+      baseline  : 0.35 rad  (~20 deg)
+      scenario A: 15 deg  (narrower tropical zone)
+      scenario B: 25 deg  (wider tropical zone)
+  Each scenario is a single deterministic run (no Monte Carlo).
 
-CONFIG section below controls all key settings.
+Metrics:
+  Country-level (A)       : Spearman, Top-5, Top-25%, Category agreement rate
+  Pair-level global (B)   : Spearman, Top-20, Top-25%
+  Pair-level BRI (C)      : Spearman, Top-10, Top-25%, Category agreement rate
+
+Risk categories (from paper):
+  very high : p(NIS) >= 0.75
+  high      : 0.50 <= p(NIS) < 0.75
+  medium    : 0.25 <= p(NIS) < 0.50
+  low       : p(NIS) < 0.25
+
+Note: pipeline values are HON-normalized, not raw P(NIS). Category
+agreement is computed on these normalized values using the same thresholds.
+The metric may be less informative if most values fall below 0.25.
 """
 
 import csv
 import math
 import sys
+import warnings
 import numpy as np
 from collections import defaultdict
 from decimal import Decimal, getcontext
@@ -38,34 +54,45 @@ getcontext().prec = 50
 # ============================================================
 # CONFIG — edit these parameters
 # ============================================================
-SIGMA_VALUES     = [0.2, 0.4]    # perturbation magnitudes to test
-N_SIMULATIONS    = 100           # Monte Carlo iterations per sigma
-STAY_ATTENUATION = False          # 'stayAttenuation' in original code
-TRADE_ADJUST     = False          # 'tradeAdjust' in original code
-TOP_N            = 10             # top-N countries for stability metric
-SEED             = 42
+SIGMA_VALUES      = [0.1, 0.3]   # perturbation magnitudes to test
+N_SIMULATIONS     = 100           # Monte Carlo iterations per sigma
+STAY_ATTENUATION  = False         # 'stayAttenuation' in original code
+TRADE_ADJUST      = False         # 'tradeAdjust' in original code
+TOP_N_COUNTRY     = 5            # top-N for country-level (small sample of 32)
+TOP_N_PAIR_GLOBAL = 20           # top-N for global country-pair stability
+TOP_N_PAIR_BRI    = 10           # top-N for BRI country-pair stability
+SEED              = 42
+
+# 32 BRI Maritime Silk Road countries, identified by Country_id.
+# Country names are resolved at runtime from portToCountry to avoid
+# hard-coding strings that may differ from the actual data.
+BRI_COUNTRY_IDS = {
+    'CHN', 'IDN', 'PHL', 'VNM', 'ARE', 'KWT', 'OMN', 'IND', 'SGP', 'BGD',
+    'LKA', 'KOR', 'MAR', 'EGY', 'PAK', 'THA', 'ITA', 'TUR', 'SAU', 'BHR',
+    'QAT', 'GRC', 'KEN', 'NZL', 'MYS', 'RUS', 'PRT', 'MLT', 'IRN', 'MMR',
+    'TUN', 'KHM',
+}
 
 # Latitude threshold scenarios (degrees -> radians)
-# Baseline is 0.35 rad; scenarios A and B override this value
 LAT_THRESHOLD_BASE = 0.35                      # ~20 deg, original value
-LAT_THRESHOLD_15   = 15.0 * math.pi / 180.0   # 0.2618 rad
-LAT_THRESHOLD_25   = 25.0 * math.pi / 180.0   # 0.4363 rad
+LAT_THRESHOLD_15   = 15.0 * math.pi / 180.0   # narrower tropical zone
+LAT_THRESHOLD_25   = 25.0 * math.pi / 180.0   # wider tropical zone
+RUN_LAT = False
 
 # Fixed baseline model parameters
-BASE_LAMBDA = 0.008          # speed decay rate in P(intro)
-BASE_AT1    = 1.29e-7        # tropical cubic coefficient
-BASE_AT2    = 8.316e-5       # tropical quadratic coefficient
-BASE_AT3    = 0.01495187     # tropical linear coefficient
-BASE_AE1    = 1.4e-9         # temperate cubic coefficient
-BASE_AE2    = 1.6566e-5      # temperate quadratic coefficient
-BASE_AE3    = 5.19377e-3     # temperate linear coefficient
-BASE_BETA   = 0.00015        # establishment base probability
-BASE_DELTA_T = 2.0           # temperature tolerance std (deg C)
-BASE_DELTA_S = 10.0          # salinity tolerance std (ppt)
+BASE_LAMBDA  = 0.008        # speed decay rate in P(intro)
+BASE_AT1     = 1.29e-7      # tropical cubic coefficient
+BASE_AT2     = 8.316e-5     # tropical quadratic coefficient
+BASE_AT3     = 0.01495187   # tropical linear coefficient
+BASE_AE1     = 1.4e-9       # temperate cubic coefficient
+BASE_AE2     = 1.6566e-5    # temperate quadratic coefficient
+BASE_AE3     = 5.19377e-3   # temperate linear coefficient
+BASE_BETA    = 0.00015      # establishment base probability
+BASE_DELTA_T = 2.0          # temperature tolerance std (deg C)
+BASE_DELTA_S = 10.0         # salinity tolerance std (ppt)
 
 # Fixed structural settings
 ORDER       = 16
-R           = 'r0'
 ENV         = 'env_'
 ECO         = 'Eco_'
 MIN_SUPPORT = 1e-20
@@ -166,11 +193,9 @@ def fouling_risk(ports, source, stay_d, distance, trip_duration,
         stay_d = stay_d * ratio
     v = distance / trip_duration
     if abs(float(ports[source]['LATITUDE_DECIMAL'])) < lat_threshold:
-        # tropical
         f = ((aT1 * stay_d ** 3 - aT2 * stay_d ** 2 + aT3 * stay_d)
              * antifouling_p * math.exp(-lambda_ * v))
     else:
-        # temperate
         f = ((aE1 * stay_d ** 3 - aE2 * stay_d ** 2 + aE3 * stay_d)
              * antifouling_p * math.exp(-lambda_ * v))
     return f
@@ -228,14 +253,12 @@ def _kld(d1, d2):
     return abs(result)
 
 def build_hon_in_memory(trajectory_list, max_order=ORDER, min_support=MIN_SUPPORT):
-    # Build_Observations_Distributions
     Distribution = defaultdict(lambda: defaultdict(list))
     for traj, prob in trajectory_list:
         target = traj[-1]
         source = tuple(traj[:-1])
         Distribution[source][target].append(prob)
 
-    # Aggregate_Probs
     final_dist = defaultdict(dict)
     for source, targets in Distribution.items():
         for target, vals in targets.items():
@@ -243,7 +266,6 @@ def build_hon_in_memory(trajectory_list, max_order=ORDER, min_support=MIN_SUPPOR
             if fp > min_support:
                 final_dist[source][target] = fp
 
-    # SourceToExtSource cache
     SourceToExtSource = defaultdict(lambda: defaultdict(set))
     for source in final_dist:
         if len(source) > 1:
@@ -255,7 +277,6 @@ def build_hon_in_memory(trajectory_list, max_order=ORDER, min_support=MIN_SUPPOR
     def kld_threshold(new_order, ext_source):
         return new_order / math.exp(1 + sum(final_dist[ext_source].values()))
 
-    # GenerateAllRules
     Rules = defaultdict(dict)
 
     def add_to_rules(source):
@@ -284,7 +305,6 @@ def build_hon_in_memory(trajectory_list, max_order=ORDER, min_support=MIN_SUPPOR
             add_to_rules(source)
             extend_rule(source, source, 1)
 
-    # BuildNetwork
     Graph = defaultdict(dict)
     for source in sorted(Rules, key=lambda x: len(x)):
         for target in Rules[source]:
@@ -299,7 +319,6 @@ def build_hon_in_memory(trajectory_list, max_order=ORDER, min_support=MIN_SUPPOR
                     except:
                         pass
 
-    # RewireTails
     to_add, to_remove = [], []
     for source in Graph:
         for target in list(Graph[source]):
@@ -323,6 +342,7 @@ def build_hon_in_memory(trajectory_list, max_order=ORDER, min_support=MIN_SUPPOR
 # ============================================================
 
 def compute_port_agg_risks(Graph):
+    """Destination port risk: mean of incoming HON edge weights."""
     phys_net = defaultdict(list)
     for source_hon, targets in Graph.items():
         src_phys = source_hon[-1]
@@ -330,35 +350,65 @@ def compute_port_agg_risks(Graph):
             dst_phys = target_hon[-1]
             if src_phys != dst_phys:
                 phys_net[(src_phys, dst_phys)].append(weight)
-
     dest_risks = defaultdict(list)
     for (src, dst), weights in phys_net.items():
         dest_risks[dst].append(float(np.mean(weights)))
-
     return {port: float(np.mean(risks)) for port, risks in dest_risks.items()}
+
+def compute_port_pair_risks(Graph):
+    """Mean HON edge weight for each physical (src_port, dst_port) pair."""
+    phys_net = defaultdict(list)
+    for source_hon, targets in Graph.items():
+        src_phys = source_hon[-1]
+        for target_hon, weight in targets.items():
+            dst_phys = target_hon[-1]
+            if src_phys != dst_phys:
+                phys_net[(src_phys, dst_phys)].append(weight)
+    return {pair: float(np.mean(weights)) for pair, weights in phys_net.items()}
 
 def agg_to_country(port_risks, portToCountry):
     country_risks = defaultdict(float)
     for port, risk in port_risks.items():
-        if port in portToCountry:
-            country_risks[portToCountry[port]['Country_name']] += risk
+        if str(port) in portToCountry:
+            country_risks[portToCountry[str(port)]['Country_name']] += risk
     return dict(country_risks)
 
-def build_country_risks_from_items(items, portToCountry):
+def agg_to_country_pair(port_pair_risks, portToCountry):
+    """Aggregate port-pair risks to (src_country, dst_country) pairs."""
+    country_pair_risks = defaultdict(float)
+    for (src_port, dst_port), risk in port_pair_risks.items():
+        src_s = str(src_port)
+        dst_s = str(dst_port)
+        if src_s in portToCountry and dst_s in portToCountry:
+            src_c = portToCountry[src_s]['Country_name']
+            dst_c = portToCountry[dst_s]['Country_name']
+            if src_c != dst_c:
+                country_pair_risks[(src_c, dst_c)] += risk
+    return dict(country_pair_risks)
+
+def build_risks_from_items(items, portToCountry):
+    """
+    Build HON and return (country_risks, pair_risks).
+    country_risks : {country: aggregated_risk}
+    pair_risks    : {(src_country, dst_country): aggregated_risk}
+    """
     if not items:
-        return {}
+        return {}, {}
     max_p = max(p for p, _ in items)
     if max_p == 0:
-        return {}
+        return {}, {}
     traj_list = []
     for prob, subseqs in items:
         norm = prob / max_p
         if norm > 0:
             for subseq in subseqs:
                 traj_list.append((subseq, norm))
-    graph      = build_hon_in_memory(traj_list)
-    port_risks = compute_port_agg_risks(graph)
-    return agg_to_country(port_risks, portToCountry)
+    graph           = build_hon_in_memory(traj_list)
+    port_risks      = compute_port_agg_risks(graph)
+    port_pair_risks = compute_port_pair_risks(graph)
+    country_risks   = agg_to_country(port_risks, portToCountry)
+    pair_risks      = agg_to_country_pair(port_pair_risks, portToCountry)
+    return country_risks, pair_risks
 
 # ============================================================
 # PIPELINE
@@ -370,17 +420,9 @@ def run_pipeline(probs_raw, ports, portToCountry, countryStayRatio,
                  lat_threshold=LAT_THRESHOLD_BASE):
     """
     One full fouling pipeline iteration.
-
-    If sigma > 0 and rng is provided, each continuous parameter is
-    independently perturbed:
-        param_i = param_i_base * max(Normal(1.0, sigma), 0)
-
-    If sigma == 0, baseline parameters are used (deterministic).
-    lat_threshold controls the tropical/temperate boundary.
-
-    Returns: country_risks dict
+    Returns (country_risks, pair_risks).
+    sigma=0 -> baseline (deterministic). sigma>0 -> perturbed Monte Carlo.
     """
-    # Sample perturbed parameters (or use baseline)
     def _p(base):
         if sigma > 0 and rng is not None:
             return base * max(float(rng.normal(1.0, sigma)), 0.0)
@@ -401,25 +443,16 @@ def run_pipeline(probs_raw, ports, portToCountry, countryStayRatio,
 
     for pair, move_list in probs_raw.items():
         source, dest = pair
-
-        p_alien = move_list[0]['_p_alien']  # precomputed, structural — not perturbed
-
-        # P(estab) — re-computed with perturbed beta / delta_T / delta_S
+        p_alien = move_list[0]['_p_alien']
         p_estab = establishment(ports, source, dest,
-                                beta=beta,
-                                delta_T=delta_T,
-                                delta_S=delta_S)
+                                beta=beta, delta_T=delta_T, delta_S=delta_S)
         if p_estab == -1:
             continue
-
         for move in move_list:
             p_f = fouling_risk(
                 ports, source,
-                move['stay_duration'],
-                move['distance'],
-                move['trip_duration'],
-                move['antifouling_p'],
-                portToCountry, countryStayRatio,
+                move['stay_duration'], move['distance'], move['trip_duration'],
+                move['antifouling_p'], portToCountry, countryStayRatio,
                 lambda_=lambda_,
                 aT1=aT1, aT2=aT2, aT3=aT3,
                 aE1=aE1, aE2=aE2, aE3=aE3,
@@ -427,35 +460,80 @@ def run_pipeline(probs_raw, ports, portToCountry, countryStayRatio,
             )
             prob_f = p_alien * p_f * p_estab
             prob_f = adjust_trade_prob(source, dest, move['vessel_type'],
-                                       prob_f, portToCountry,
-                                       exportDict, importDict)
+                                       prob_f, portToCountry, exportDict, importDict)
             fouling_items.append((prob_f, move['subseq']))
 
-    return build_country_risks_from_items(fouling_items, portToCountry)
+    return build_risks_from_items(fouling_items, portToCountry)
 
 # ============================================================
-# STABILITY METRICS  (same as bw_sensitivity_analysis.py)
+# METRICS
 # ============================================================
 
-def make_baseline_info(country_risks):
-    countries = sorted(country_risks.keys())
-    n         = len(countries)
-    values    = np.array([country_risks.get(c, 0.0) for c in countries])
-    order     = values.argsort()[::-1]
-    top_n     = set(np.array(countries)[order[:TOP_N]])
-    topQ      = set(np.array(countries)[order[:n // 4]])
-    return countries, n, values, top_n, topQ
+def spearman_safe(a, b):
+    """Spearman correlation; returns nan without warning if input is constant."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        corr, _ = spearmanr(a, b)
+    return float(corr)
 
-def compute_metrics(baseline_values, sim_values, all_countries,
-                    top_n_baseline, topQ_baseline, n_countries):
-    corr, _   = spearmanr(baseline_values, sim_values)
-    sim_order  = sim_values.argsort()[::-1]
-    countries  = np.array(all_countries)
-    top_n_sim  = set(countries[sim_order[:TOP_N]])
-    topQ_sim   = set(countries[sim_order[:n_countries // 4]])
-    top_n_pct  = len(top_n_baseline & top_n_sim) / TOP_N * 100
-    topQ_pct   = len(topQ_baseline  & topQ_sim)  / len(topQ_baseline) * 100
-    return corr, top_n_pct, topQ_pct
+def risk_category(value):
+    """Paper risk classification (applied to normalized pipeline values)."""
+    if value >= 0.75:   return 'very high'
+    elif value >= 0.50: return 'high'
+    elif value >= 0.25: return 'medium'
+    else:               return 'low'
+
+def category_agreement_rate(base_risks, sim_risks, entities):
+    """
+    Fraction (%) of entities whose risk category is unchanged after perturbation.
+    entities: list of country names or (src, dst) tuples.
+    """
+    if not entities:
+        return float('nan')
+    n_agree = sum(
+        1 for e in entities
+        if risk_category(base_risks.get(e, 0.0)) == risk_category(sim_risks.get(e, 0.0))
+    )
+    return n_agree / len(entities) * 100
+
+def make_baseline_info(risks, key_list, top_n):
+    """
+    key_list : sorted list of countries or pair-tuples to analyse.
+    Returns  : (values_array, top_n_set, topQ_set)
+    """
+    values  = np.array([risks.get(k, 0.0) for k in key_list])
+    n       = len(key_list)
+    order   = values.argsort()[::-1]
+    top_n_set = set(key_list[i] for i in order[:top_n])
+    topQ_set  = set(key_list[i] for i in order[:max(1, n // 4)])
+    return values, top_n_set, topQ_set
+
+def compute_metrics(base_values, sim_risks, key_list,
+                    base_top_n, base_topQ, top_n,
+                    base_risks_for_cat=None, entities_for_cat=None):
+    """
+    General metric computation for both country-level and pair-level.
+    If base_risks_for_cat and entities_for_cat are provided, also computes
+    category agreement rate.
+    Returns: (spearman, top_n_pct, topQ_pct, cat_agree_pct)
+             cat_agree_pct is nan if not requested.
+    """
+    n        = len(key_list)
+    sim_vals = np.array([sim_risks.get(k, 0.0) for k in key_list])
+    corr     = spearman_safe(base_values, sim_vals)
+
+    sim_order = sim_vals.argsort()[::-1]
+    sim_top_n = set(key_list[i] for i in sim_order[:top_n])
+    sim_topQ  = set(key_list[i] for i in sim_order[:max(1, n // 4)])
+
+    top_n_pct = len(base_top_n & sim_top_n) / top_n * 100
+    topQ_pct  = len(base_topQ  & sim_topQ)  / len(base_topQ) * 100
+
+    cat_agree = float('nan')
+    if base_risks_for_cat is not None and entities_for_cat:
+        cat_agree = category_agreement_rate(base_risks_for_cat, sim_risks, entities_for_cat)
+
+    return corr, top_n_pct, topQ_pct, cat_agree
 
 # ============================================================
 # MAIN
@@ -465,14 +543,17 @@ def main():
     print("=" * 60)
     print("Sensitivity Analysis — Biofouling model parameters")
     print("=" * 60)
-    print(f"sigma values:     {SIGMA_VALUES}")
-    print(f"N simulations:    {N_SIMULATIONS}")
-    print(f"stayAttenuation:  {STAY_ATTENUATION}")
-    print(f"tradeAdjust:      {TRADE_ADJUST}")
-    print(f"Lat threshold (baseline): {LAT_THRESHOLD_BASE:.4f} rad"
-          f"  (~{math.degrees(LAT_THRESHOLD_BASE):.1f} deg)")
-    print(f"Lat threshold (15 deg):   {LAT_THRESHOLD_15:.4f} rad")
-    print(f"Lat threshold (25 deg):   {LAT_THRESHOLD_25:.4f} rad")
+    print(f"sigma values:          {SIGMA_VALUES}")
+    print(f"N simulations:         {N_SIMULATIONS}")
+    print(f"stayAttenuation:       {STAY_ATTENUATION}")
+    print(f"tradeAdjust:           {TRADE_ADJUST}")
+    print(f"TOP_N_COUNTRY:         {TOP_N_COUNTRY}  (BRI countries only)")
+    print(f"TOP_N_PAIR_GLOBAL:     {TOP_N_PAIR_GLOBAL}")
+    print(f"TOP_N_PAIR_BRI:        {TOP_N_PAIR_BRI}")
+    print(f"Lat threshold base:    {LAT_THRESHOLD_BASE:.4f} rad "
+          f"(~{math.degrees(LAT_THRESHOLD_BASE):.1f} deg)")
+    print(f"Lat threshold 15 deg:  {LAT_THRESHOLD_15:.4f} rad")
+    print(f"Lat threshold 25 deg:  {LAT_THRESHOLD_25:.4f} rad")
     print()
 
     # ---- Load static data (once) ----
@@ -488,6 +569,17 @@ def main():
     with open(port_to_country_file) as f:
         for row in csv.DictReader(f):
             portToCountry[row['Port_id']] = row
+
+    # Resolve BRI country names from IDs using the loaded portToCountry data
+    _id_to_name = {}
+    for row in portToCountry.values():
+        _id_to_name[row['Country_id']] = row['Country_name']
+    BRI_COUNTRY_NAMES = {_id_to_name[cid] for cid in BRI_COUNTRY_IDS
+                         if cid in _id_to_name}
+    missing_ids = BRI_COUNTRY_IDS - set(_id_to_name.keys())
+    if missing_ids:
+        print(f"  WARNING: BRI country IDs not found in portToCountry: {missing_ids}")
+    print(f"  BRI country names resolved: {len(BRI_COUNTRY_NAMES)} / {len(BRI_COUNTRY_IDS)}")
 
     exportDict = {}
     importDict = {}
@@ -549,12 +641,12 @@ def main():
                 if pair not in probs_raw:
                     probs_raw[pair] = []
                 probs_raw[pair].append({
-                    'trip_duration':  float(trip_dur),
-                    'stay_duration':  float(stay_dur),
-                    'antifouling_p':  float(prev_move['ANTIFOULING PROB']),
-                    'distance':       float(distance),
-                    'subseq':         subseq,
-                    'vessel_type':    prev_move['VESSEL TYPE'],
+                    'trip_duration': float(trip_dur),
+                    'stay_duration': float(stay_dur),
+                    'antifouling_p': float(prev_move['ANTIFOULING PROB']),
+                    'distance':      float(distance),
+                    'subseq':        subseq,
+                    'vessel_type':   prev_move['VESSEL TYPE'],
                 })
             except:
                 pass
@@ -564,7 +656,7 @@ def main():
     print(f"  ProbsRaw built: {len(probs_raw)} port pairs")
 
     # ---- Precompute p_alien (structural, never perturbed) ----
-    print("Precomputing p_alien (structural)...")
+    print("Precomputing p_alien...")
     for pair, move_list in probs_raw.items():
         source, dest = pair
         p_alien = (1 if ECO == 'noEco_'
@@ -574,6 +666,38 @@ def main():
             move['_p_alien'] = p_alien
     print("  Done.")
 
+    # ---- Baseline run ----
+    print("\nComputing baseline (sigma=0, lat_threshold=baseline)...")
+    base_country_risks, base_pair_risks = run_pipeline(
+        probs_raw, ports, portToCountry, countryStayRatio,
+        exportDict, importDict, rng=None, sigma=0.0,
+        lat_threshold=LAT_THRESHOLD_BASE,
+    )
+
+    # --- Country-level setup (BRI only) ---
+    bri_list = sorted([c for c in base_country_risks if c in BRI_COUNTRY_NAMES])
+    print(f"  BRI countries found in results: {len(bri_list)} / {len(BRI_COUNTRY_NAMES)}")
+    missing = BRI_COUNTRY_NAMES - set(bri_list)
+    if missing:
+        print(f"  WARNING: BRI countries not in results (check name mapping): {sorted(missing)}")
+    base_vals_c, base_top5, base_topQ_c = make_baseline_info(
+        base_country_risks, bri_list, TOP_N_COUNTRY)
+    print(f"  Baseline top-{TOP_N_COUNTRY} (BRI): "
+          f"{sorted(base_top5)}")
+
+    # --- Pair-level setup (global) ---
+    all_pairs = sorted(base_pair_risks.keys())
+    base_vals_pg, base_top20, base_topQ_pg = make_baseline_info(
+        base_pair_risks, all_pairs, TOP_N_PAIR_GLOBAL)
+    print(f"  Global pairs: {len(all_pairs)}")
+
+    # --- Pair-level setup (BRI only) ---
+    bri_pairs = sorted([p for p in all_pairs
+                        if p[0] in BRI_COUNTRY_NAMES and p[1] in BRI_COUNTRY_NAMES])
+    base_vals_pb, base_top10_bri, base_topQ_pb = make_baseline_info(
+        base_pair_risks, bri_pairs, TOP_N_PAIR_BRI)
+    print(f"  BRI pairs: {len(bri_pairs)}")
+
     # ============================================================
     # PART 1 — MONTE CARLO PARAMETER PERTURBATION
     # ============================================================
@@ -581,109 +705,235 @@ def main():
     print("PART 1 — Monte Carlo parameter perturbation")
     print("=" * 60)
 
-    print("\nComputing baseline (sigma=0, lat_threshold=baseline)...")
-    base_risks = run_pipeline(
-        probs_raw, ports, portToCountry, countryStayRatio,
-        exportDict, importDict,
-        rng=None, sigma=0.0,
-        lat_threshold=LAT_THRESHOLD_BASE,
-    )
-    countries, n_c, base_values, base_top_n, base_topQ = make_baseline_info(base_risks)
-    print(f"  Countries: {n_c}, top-{TOP_N}: {sorted(base_top_n)}")
-
     mc_results = {}
     for sigma in SIGMA_VALUES:
         print(f"\nMonte Carlo: sigma={sigma}, N={N_SIMULATIONS} ...")
         rng = np.random.RandomState(SEED)
-        corr_list, top_n_list, topQ_list = [], [], []
+
+        # collectors: country
+        c_corr, c_top5, c_topQ, c_cat = [], [], [], []
+        # collectors: global pair
+        pg_corr, pg_top20, pg_topQ = [], [], []
+        # collectors: BRI pair
+        pb_corr, pb_top10, pb_topQ, pb_cat = [], [], [], []
+        nan_count = 0
 
         for i in range(N_SIMULATIONS):
             if (i + 1) % 10 == 0:
                 print(f"  {i+1}/{N_SIMULATIONS}")
-            sim_risks = run_pipeline(
+
+            sim_c_risks, sim_p_risks = run_pipeline(
                 probs_raw, ports, portToCountry, countryStayRatio,
                 exportDict, importDict,
                 rng=rng, sigma=sigma,
                 lat_threshold=LAT_THRESHOLD_BASE,
             )
-            sim_vals = np.array([sim_risks.get(c, 0.0) for c in countries])
-            corr, tn, tq = compute_metrics(base_values, sim_vals, countries,
-                                           base_top_n, base_topQ, n_c)
-            corr_list.append(corr)
-            top_n_list.append(tn)
-            topQ_list.append(tq)
+
+            # Country-level (BRI)
+            corr, tn, tq, ca = compute_metrics(
+                base_vals_c, sim_c_risks, bri_list,
+                base_top5, base_topQ_c, TOP_N_COUNTRY,
+                base_risks_for_cat=base_country_risks,
+                entities_for_cat=bri_list,
+            )
+            if np.isnan(corr):
+                nan_count += 1
+            c_corr.append(corr); c_top5.append(tn)
+            c_topQ.append(tq);   c_cat.append(ca)
+
+            # Global pairs
+            corr_pg, tn_pg, tq_pg, _ = compute_metrics(
+                base_vals_pg, sim_p_risks, all_pairs,
+                base_top20, base_topQ_pg, TOP_N_PAIR_GLOBAL,
+            )
+            pg_corr.append(corr_pg); pg_top20.append(tn_pg); pg_topQ.append(tq_pg)
+
+            # BRI pairs
+            corr_pb, tn_pb, tq_pb, ca_pb = compute_metrics(
+                base_vals_pb, sim_p_risks, bri_pairs,
+                base_top10_bri, base_topQ_pb, TOP_N_PAIR_BRI,
+                base_risks_for_cat=base_pair_risks,
+                entities_for_cat=bri_pairs,
+            )
+            pb_corr.append(corr_pb); pb_top10.append(tn_pb)
+            pb_topQ.append(tq_pb);   pb_cat.append(ca_pb)
 
         mc_results[sigma] = {
-            'corr_mean':  np.mean(corr_list),
-            'corr_std':   np.std(corr_list),
-            'corr_min':   np.min(corr_list),
-            'top_n_mean': np.mean(top_n_list),
-            'top_n_min':  np.min(top_n_list),
-            'topQ_mean':  np.mean(topQ_list),
-            'topQ_min':   np.min(topQ_list),
+            'nan_count': nan_count,
+            'country': {
+                'corr_mean':  np.nanmean(c_corr),
+                'corr_std':   np.nanstd(c_corr),
+                'corr_min':   np.nanmin(c_corr),
+                'top_n_mean': np.mean(c_top5),
+                'top_n_min':  np.min(c_top5),
+                'topQ_mean':  np.mean(c_topQ),
+                'topQ_min':   np.min(c_topQ),
+                'cat_mean':   np.nanmean(c_cat),
+                'cat_min':    np.nanmin(c_cat),
+            },
+            'pair_global': {
+                'corr_mean':  np.nanmean(pg_corr),
+                'corr_std':   np.nanstd(pg_corr),
+                'corr_min':   np.nanmin(pg_corr),
+                'top_n_mean': np.mean(pg_top20),
+                'top_n_min':  np.min(pg_top20),
+                'topQ_mean':  np.mean(pg_topQ),
+                'topQ_min':   np.min(pg_topQ),
+            },
+            'pair_bri': {
+                'corr_mean':  np.nanmean(pb_corr),
+                'corr_std':   np.nanstd(pb_corr),
+                'corr_min':   np.nanmin(pb_corr),
+                'top_n_mean': np.mean(pb_top10),
+                'top_n_min':  np.min(pb_top10),
+                'topQ_mean':  np.mean(pb_topQ),
+                'topQ_min':   np.min(pb_topQ),
+                'cat_mean':   np.nanmean(pb_cat),
+                'cat_min':    np.nanmin(pb_cat),
+            },
         }
 
     # ============================================================
     # PART 2 — LATITUDE THRESHOLD SCENARIO ANALYSIS
     # ============================================================
-    print("\n" + "=" * 60)
-    print("PART 2 — Latitude threshold scenario analysis")
-    print("(fixed parameters, baseline sigma=0)")
-    print("=" * 60)
 
-    scenario_results = {}
-    for label, threshold in [
-        ('15 deg', LAT_THRESHOLD_15),
-        ('25 deg', LAT_THRESHOLD_25),
-    ]:
-        print(f"\nScenario: lat_threshold = {label} ({threshold:.4f} rad)...")
-        scen_risks = run_pipeline(
-            probs_raw, ports, portToCountry, countryStayRatio,
-            exportDict, importDict,
-            rng=None, sigma=0.0,
-            lat_threshold=threshold,
-        )
-        scen_vals = np.array([scen_risks.get(c, 0.0) for c in countries])
-        corr, tn, tq = compute_metrics(base_values, scen_vals, countries,
-                                       base_top_n, base_topQ, n_c)
-        scen_order   = scen_vals.argsort()[::-1]
-        scen_top_n   = list(np.array(countries)[scen_order[:TOP_N]])
-        scenario_results[label] = {
-            'corr':       corr,
-            'top_n_pct':  tn,
-            'topQ_pct':   tq,
-            'top_n_list': scen_top_n,
-        }
+    if RUN_LAT:
+        print("\n" + "=" * 60)
+        print("PART 2 — Latitude threshold scenario analysis")
+        print("(fixed parameters, sigma=0)")
+        print("=" * 60)
+
+        scenario_results = {}
+        for label, threshold in [('15 deg', LAT_THRESHOLD_15), ('25 deg', LAT_THRESHOLD_25)]:
+            print(f"\nScenario: {label} ({threshold:.4f} rad)...")
+            scen_c_risks, scen_p_risks = run_pipeline(
+                probs_raw, ports, portToCountry, countryStayRatio,
+                exportDict, importDict,
+                rng=None, sigma=0.0, lat_threshold=threshold,
+            )
+
+            # Country-level (BRI)
+            corr_c, tn_c, tq_c, ca_c = compute_metrics(
+                base_vals_c, scen_c_risks, bri_list,
+                base_top5, base_topQ_c, TOP_N_COUNTRY,
+                base_risks_for_cat=base_country_risks,
+                entities_for_cat=bri_list,
+            )
+            scen_c_order = np.array([scen_c_risks.get(c, 0.0) for c in bri_list]).argsort()[::-1]
+            scen_top5_list = [bri_list[i] for i in scen_c_order[:TOP_N_COUNTRY]]
+
+            # Global pairs
+            corr_pg, tn_pg, tq_pg, _ = compute_metrics(
+                base_vals_pg, scen_p_risks, all_pairs,
+                base_top20, base_topQ_pg, TOP_N_PAIR_GLOBAL,
+            )
+            scen_pg_order = np.array([scen_p_risks.get(p, 0.0) for p in all_pairs]).argsort()[::-1]
+            scen_top20_list = [all_pairs[i] for i in scen_pg_order[:TOP_N_PAIR_GLOBAL]]
+
+            # BRI pairs
+            corr_pb, tn_pb, tq_pb, ca_pb = compute_metrics(
+                base_vals_pb, scen_p_risks, bri_pairs,
+                base_top10_bri, base_topQ_pb, TOP_N_PAIR_BRI,
+                base_risks_for_cat=base_pair_risks,
+                entities_for_cat=bri_pairs,
+            )
+            scen_pb_order = np.array([scen_p_risks.get(p, 0.0) for p in bri_pairs]).argsort()[::-1]
+            scen_top10_bri_list = [bri_pairs[i] for i in scen_pb_order[:TOP_N_PAIR_BRI]]
+
+            scenario_results[label] = {
+                'country':     {'corr': corr_c, 'top_n': tn_c, 'topQ': tq_c,
+                                'cat': ca_c, 'top_n_list': scen_top5_list},
+                'pair_global': {'corr': corr_pg, 'top_n': tn_pg, 'topQ': tq_pg,
+                                'top_n_list': scen_top20_list},
+                'pair_bri':    {'corr': corr_pb, 'top_n': tn_pb, 'topQ': tq_pb,
+                                'cat': ca_pb, 'top_n_list': scen_top10_bri_list},
+            }
 
     # ============================================================
     # PRINT RESULTS
     # ============================================================
+    def _fmt(v, pct=False):
+        if np.isnan(v):
+            return '  nan  '
+        return f"{v:.1f}%" if pct else f"{v:.4f}"
+
     print("\n" + "=" * 60)
     print("RESULTS — PART 1: Monte Carlo parameter perturbation")
     print("=" * 60)
-    print(f"  Baseline top-{TOP_N}: {sorted(base_top_n)}\n")
-    for sigma, r in mc_results.items():
-        print(f"  sigma = {sigma}  (+-{int(sigma*100)}% independent perturbation"
-              f" on each continuous parameter)")
-        print(f"    Spearman:          {r['corr_mean']:.4f} +- {r['corr_std']:.4f}"
-              f"  (min = {r['corr_min']:.4f})")
-        print(f"    Top-{TOP_N} stability: {r['top_n_mean']:.1f}% mean"
-              f"  (min = {r['top_n_min']:.1f}%)")
-        print(f"    Top-Q stability:   {r['topQ_mean']:.1f}% mean"
-              f"  (min = {r['topQ_min']:.1f}%)")
+    print(f"  Baseline top-{TOP_N_COUNTRY} BRI countries: {sorted(base_top5)}")
+    print(f"  Baseline top-{TOP_N_PAIR_GLOBAL} global pairs: {sorted(base_top20)[:5]} ...")
+    print(f"  Baseline top-{TOP_N_PAIR_BRI} BRI pairs:    {sorted(base_top10_bri)[:5]} ...\n")
+
+    for sigma, res in mc_results.items():
+        print(f"  sigma = {sigma}  (+-{int(sigma*100)}% independent perturbation)")
+        if res['nan_count'] > 0:
+            print(f"    [Note] {res['nan_count']} / {N_SIMULATIONS} runs produced NaN Spearman "
+                  f"(collapsed probabilities); excluded from mean/std via nanmean.")
+
+        r = res['country']
+        print(f"\n  [A] Country-level — BRI ({len(bri_list)} countries)")
+        print(f"    Spearman:            {_fmt(r['corr_mean'])} +- {_fmt(r['corr_std'])}"
+              f"  (min = {_fmt(r['corr_min'])})")
+        print(f"    Top-{TOP_N_COUNTRY} stability:    {_fmt(r['top_n_mean'], True)} mean"
+              f"  (min = {_fmt(r['top_n_min'], True)})")
+        print(f"    Top-Q stability:     {_fmt(r['topQ_mean'], True)} mean"
+              f"  (min = {_fmt(r['topQ_min'], True)})")
+        print(f"    Category agreement:  {_fmt(r['cat_mean'], True)} mean"
+              f"  (min = {_fmt(r['cat_min'], True)})")
+
+        r = res['pair_global']
+        print(f"\n  [B] Pair-level — Global ({len(all_pairs)} pairs)")
+        print(f"    Spearman:            {_fmt(r['corr_mean'])} +- {_fmt(r['corr_std'])}"
+              f"  (min = {_fmt(r['corr_min'])})")
+        print(f"    Top-{TOP_N_PAIR_GLOBAL} stability:   {_fmt(r['top_n_mean'], True)} mean"
+              f"  (min = {_fmt(r['top_n_min'], True)})")
+        print(f"    Top-Q stability:     {_fmt(r['topQ_mean'], True)} mean"
+              f"  (min = {_fmt(r['topQ_min'], True)})")
+
+        r = res['pair_bri']
+        print(f"\n  [C] Pair-level — BRI ({len(bri_pairs)} pairs)")
+        print(f"    Spearman:            {_fmt(r['corr_mean'])} +- {_fmt(r['corr_std'])}"
+              f"  (min = {_fmt(r['corr_min'])})")
+        print(f"    Top-{TOP_N_PAIR_BRI} stability:   {_fmt(r['top_n_mean'], True)} mean"
+              f"  (min = {_fmt(r['top_n_min'], True)})")
+        print(f"    Top-Q stability:     {_fmt(r['topQ_mean'], True)} mean"
+              f"  (min = {_fmt(r['topQ_min'], True)})")
+        print(f"    Category agreement:  {_fmt(r['cat_mean'], True)} mean"
+              f"  (min = {_fmt(r['cat_min'], True)})")
         print()
 
-    print("=" * 60)
-    print("RESULTS — PART 2: Latitude threshold scenarios")
-    print("=" * 60)
-    print(f"  Baseline (~20 deg) top-{TOP_N}: {sorted(base_top_n)}\n")
-    for label, r in scenario_results.items():
-        print(f"  Scenario: {label}")
-        print(f"    Spearman vs baseline:  {r['corr']:.4f}")
-        print(f"    Top-{TOP_N} overlap:       {r['top_n_pct']:.1f}%")
-        print(f"    Top-Q overlap:         {r['topQ_pct']:.1f}%")
-        print(f"    Top-{TOP_N} countries:     {r['top_n_list']}")
-        print()
+    if RUN_LAT:
+        print("=" * 60)
+        print("RESULTS — PART 2: Latitude threshold scenarios")
+        print("=" * 60)
+        print(f"  Baseline (~20 deg) top-{TOP_N_COUNTRY} BRI: {sorted(base_top5)}\n")
+
+        for label, res in scenario_results.items():
+            print(f"  Scenario: {label}")
+
+            r = res['country']
+            print(f"  [A] Country-level — BRI")
+            print(f"    Spearman:           {_fmt(r['corr'])}")
+            print(f"    Top-{TOP_N_COUNTRY} overlap:     {_fmt(r['top_n'], True)}")
+            print(f"    Top-Q overlap:      {_fmt(r['topQ'], True)}")
+            print(f"    Category agreement: {_fmt(r['cat'], True)}")
+            print(f"    Top-{TOP_N_COUNTRY} countries:   {r['top_n_list']}")
+
+            r = res['pair_global']
+            print(f"  [B] Pair-level — Global")
+            print(f"    Spearman:           {_fmt(r['corr'])}")
+            print(f"    Top-{TOP_N_PAIR_GLOBAL} overlap:    {_fmt(r['top_n'], True)}")
+            print(f"    Top-Q overlap:      {_fmt(r['topQ'], True)}")
+            print(f"    Top-{TOP_N_PAIR_GLOBAL} pairs:      {r['top_n_list'][:5]} ...")
+
+            r = res['pair_bri']
+            print(f"  [C] Pair-level — BRI")
+            print(f"    Spearman:           {_fmt(r['corr'])}")
+            print(f"    Top-{TOP_N_PAIR_BRI} overlap:    {_fmt(r['top_n'], True)}")
+            print(f"    Top-Q overlap:      {_fmt(r['topQ'], True)}")
+            print(f"    Category agreement: {_fmt(r['cat'], True)}")
+            print(f"    Top-{TOP_N_PAIR_BRI} BRI pairs:  {r['top_n_list']}")
+            print()
 
 
 if __name__ == '__main__':
