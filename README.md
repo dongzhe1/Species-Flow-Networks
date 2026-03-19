@@ -358,8 +358,8 @@ held at their baseline values.
 | Scenario | Threshold | Rationale |
 |----------|-----------|-----------|
 | Baseline | 0.35 rad ≈ 20° | Original model value |
-| Scenario A | 15° (0.262 rad) | Wider tropical zone |
-| Scenario B | 25° (0.436 rad) | Narrower tropical zone |
+| Scenario A | 15° (0.262 rad) | Narrower tropical zone |
+| Scenario B | 25° (0.436 rad) | Wider tropical zone |
 
 Each scenario produces a single deterministic country risk ranking, compared
 to baseline using Spearman correlation and Top-10 / Top-Q overlap.
@@ -371,8 +371,8 @@ Iran, Italy, Malaysia, Philippines, U.S.A.
 
 | Scenario | Spearman | Top-10 overlap | Top-Q overlap |
 |----------|----------|---------------|---------------|
-| 15° (wider tropical zone) | 1.0000 | 100.0% | 100.0% |
-| 25° (narrower tropical zone) | 1.0000 | 100.0% | 100.0% |
+| 15° (narrower tropical zone) | 1.0000 | 100.0% | 100.0% |
+| 25° (wider tropical zone) | 1.0000 | 100.0% | 100.0% |
 
 The tropical/temperate boundary has no effect on the country-level risk
 rankings: both alternative thresholds produce identical top-10 and top-Q
