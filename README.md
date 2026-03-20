@@ -381,7 +381,7 @@ Baseline top-5 BRI countries: India, Indonesia, Iran, Italy, Philippines
 | 0.3 (±30%) | 0.9893 ± 0.0152 | 0.8835 | 87.9% | 70.0% | 93.8% | 78.6% | 94.1% | 79.2% |
 | 0.4 (±40%) ² | 0.9725 ± 0.0868 | 0.1463 | 81.0% | 10.0% | 90.2% | 25.6% | 92.7% | 79.6% |
 
-² At σ = 0.4, 1 out of 100 runs produced a NaN Spearman correlation because
+² At σ = 0.4, 1 out of 100 runs may produce a NaN Spearman correlation because
 extreme parameter draws caused all biofouling probabilities to collapse to
 zero, yielding a degenerate constant risk vector. This run is excluded from
 mean and std via nanmean. The σ = 0.4 scenario represents a physically
