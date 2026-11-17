@@ -1,0 +1,10 @@
+place_id,place_name,wrong_lat,wrong_lon,lat,lon,reason
+5569,Panama Canal,9.08,79.68,9.08,-79.68,"longitude sign: the point lay in the Indian Ocean (found 2026-11-16, A1 check)"
+1546,Palma(Canary Is),28.683333,17.766667,28.683333,-17.766667,"longitude sign (La Palma, Canary Islands, 17.77 W)"
+3096,Columbia River,45.5477,122.2655,45.5477,-122.2655,"longitude sign (Columbia River, Oregon/Washington)"
+5229,Angola,12.3185,13.5571,-12.3185,13.5571,"latitude sign (Angola lies south of the equator)"
+10038,Basker-Manta Field,39.2667,147.55,-39.2667,147.55,"latitude sign (Bass Strait, Australia)"
+7859,Moriusaq,76.7333,69.6,76.7333,-69.6,"longitude sign (Moriusaq, north-west Greenland, 69.6 W)"
+8811,Hubbard Glacier,59.9949,139.5456,59.9949,-139.5456,"longitude sign (Hubbard Glacier, Alaska)"
+8771,Vancouver Anch.(CAN),49.2579,123.3092,49.2579,-123.3092,"longitude sign (Vancouver anchorages, 123.3 W)"
+1241,Innoshima,34.2833,113.1667,34.2833,133.1667,"longitude digit (Innoshima, Hiroshima, 133.17 E; 113 E is inland China)"

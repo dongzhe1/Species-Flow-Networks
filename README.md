@@ -24,7 +24,11 @@ HON_Code/
 ├── 03_Build-SF-HON.ipynb           # Step 3: build SF-HON from weighted sequences
 ├── 04_make_HONet_dict.ipynb        # Step 4: aggregate risks to country level
 ├── 05_translate_clusters-HON.ipynb # Step 5: cluster translation for GIS visualization
-└── p_intro.py                      # Standalone P(intro) calculation utilities
+├── p_intro.py                      # Standalone P(intro) calculation utilities
+├── hon_sf.py                       # Steps 2-4 as one script (no notebooks), with bug fixes (section 6)
+├── compare_legacy.py               # Checks hon_sf.py --legacy against the notebook outputs
+├── reference/place_coords_fix.csv  # Known coordinate errors in the place table
+└── tests/test_hon_sf.py            # Tests, one per fixed bug
 
 data/
 └── 2008/  (and other years)
@@ -438,3 +442,82 @@ overlap, driven by a small number of border-zone ports switching classification,
 but Spearman remains perfect and Top-Q overlap is 100%. This confirms that
 the tropical/temperate classification boundary is not a sensitive assumption
 for the study's conclusions.
+
+---
+
+## 6. Script version: `hon_sf.py` (2026-11-17)
+
+`Code/HON_Code/hon_sf.py` runs steps 2–4 (`02_Prepare_HON_Input`, `03_Build-SF-HON`, `04_make_HONet_dict`, with
+`scripts/build_rules_utils.py` and `scripts/make_HONet_dic.py`) as one script. It needs only numpy. The notebooks
+are unchanged.
+
+```
+python Code/HON_Code/hon_sf.py run --moves data/moves/moves_cleaned_2018.txt \
+    --places data/Places_allportdata_mergedSept2017.csv --port-country data/stay/portToCountry.csv \
+    --out <dir>
+```
+
+The steps can also be run one by one (`prepare`, `build`, `aggregate`, same `--out`). Options: `--eco {eco,same,none}`
+(P(alien): same or neighbouring ecoregion, same ecoregion only, none; default `eco`, the `Eco_` setting of
+section 4.1), `--no-env`, `--regime {r0,r1,r2,r3}`, `--order`, `--max-order`, `--min-support`, `--coords-fix`,
+`--scale-from` (see 6.4) and `--legacy`.
+
+Outputs: `input_{ballast,fouling}.txt` (weighted sub-trajectories), `rules_*.txt`, `honet_*.csv`, `net_*.txt`
+(physical port network), `links_*.csv`, `port_risk_out_*.txt` (the agg_risk files of step 4), `port_risk.csv`
+(outgoing and incoming port risk for both vectors), `trans_honet_*.{net,dic}` (for clustering) and
+`hon_summary.json` (counts and settings).
+
+Not converted: step 0 (raw moves to `moves_cleaned`), step 1 (its output is not read by later steps), step 5 (GIS
+figures), and the trade and stay adjustments of step 2 (switched off there).
+
+### 6.1 Check against the notebooks
+
+`--legacy` reproduces the notebooks as they were run for the 2018 outputs (step 2 with the moves filter: stays under
+20 days, nine cargo types, no domestic legs), bugs included. On `moves_cleaned_2018.txt`, all 16 outputs have the
+same lines as the notebook outputs in `data/2018`, with values within 7e-13 (relative):
+
+```
+python Code/HON_Code/hon_sf.py run --legacy ... --out <dir>
+python Code/HON_Code/compare_legacy.py <dir> data/2018
+```
+
+### 6.2 Fixed without `--legacy`
+
+| # | Step | Problem in the notebooks | Fix | 2018 (legacy run) |
+|---|------|--------------------------|-----|-------------------|
+| 1 | 2 | Tropical test compares latitude in degrees with 0.35, a value in radians (≈ 20°, section 4.3): only ports within 0.35° of the equator use the tropical polynomial | Latitude in radians < 0.35 | — |
+| 2 | 2 | Ballast P(intro) uses the trip duration of the last leg in the file for every leg (a variable left over from a loop) | Each leg's own trip duration | — |
+| 3 | 2 | Dropping a move (domestic leg, stay ≥ 20 days) joins the moves around it: A→B→C becomes A→C, with B→C's duration | A leg is two consecutive moves. Domestic legs, legs after a stay of 20 days or more and legs under one hour get no risk record, but their ports stay in the ship's trajectory | — |
+| 4 | 4 | Collapsing higher-order nodes to ports sums probabilities; the sum can exceed 1 | P(at least one) = 1 − ∏(1 − r) | 822 ballast and 82 fouling links > 1; 231 port risks outside [0, 1] |
+| 5 | 2 | Biofouling uses the stay at the destination port; step 0 documents it as the stay at the source port | Source port's stay; the 20-day limit applies to it | — |
+| 6 | 2 | The maximum used to scale P(NIS) takes P(alien) = 0 for the same or a neighbouring ecoregion; the written values for the same ecoregion only | One rule (`--eco`) for both | 10 fouling values > 1 |
+| 7 | 3 | The first observation of a new target under an existing source is stored twice and weighs double in the mean | Stored once | — |
+| 8 | 4 | 1 − ∏(1 − r) loses every r below ~1e-16 | Computed as −expm1(Σ log1p(−r)) | — |
+| 9 | 4 | The ballast node dictionary for clustering is built from the fouling network's nodes | Each network's own nodes | 41,486 ballast edges not written |
+| 10 | data | Nine places in `Places_allportdata_mergedSept2017.csv` have a sign or digit error (Panama Canal at 79.68 E, Vancouver Anch. at 123.3 E, ...); they enter leg distances and the link table | Corrected from `reference/place_coords_fix.csv` while the table still holds the wrong values | — |
+
+Effect on 2018 (Spearman correlation of port risks, legacy vs fixed, ballast/fouling): with `--eco eco`, outgoing
+0.77/0.63 and incoming 0.83/0.67; with `--eco same`, outgoing 0.87/0.83 and incoming 0.96/0.88. The large ports'
+risks are close to 1 in both, so their order at the top is not informative.
+
+### 6.3 Not changed
+
+- The KLD test uses p · exp(p/q) and the threshold order / exp(1 + Σp), as in the original code (the HON paper uses
+  log and counts). Kept as a method choice.
+- Step 0 (not converted) drops the first move of every ship when grouping moves by ship, and in its 1997–2012 branch
+  the row index advances only on valid rows. Files made by step 0 (`moves_cleaned_*`) carry the first problem.
+- `sensitivity_analysis/fouling.py` and `ballast_water.py` compare latitude in degrees with 0.35 rad, take the
+  destination stay, and drop moves before pairing (problems 1, 5 and 3 above). The latitude scenarios of section 5.2
+  (Part 2) therefore moved the tropical boundary only within about 0.5° of the equator.
+
+### 6.4 Comparing years
+
+Step 2 divides every P(NIS) by the largest in the file, so years run separately are on different scales, and the
+HON rule threshold depends on that scale. `--scale-from <hon_summary.json ...>` uses the largest maxima of the given
+runs, so that several years share one scale.
+
+### 6.5 Tests
+
+```
+python -m pytest Code/HON_Code/tests
+```
