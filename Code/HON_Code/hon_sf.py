@@ -2,10 +2,10 @@
 """Species-flow higher-order network (SF-HON): ballast-water and biofouling introduction risk along ship trajectories.
 
 Script version (2026-11-17) of the notebooks 02_Prepare_HON_Input, 03_Build-SF-HON, 04_make_HONet_dict and of
-scripts/build_rules_utils.py, scripts/make_HONet_dic.py, in one file that needs only numpy. The notebooks are kept
-unchanged. Not converted: 00_sort_clean_moves (raw Lloyd's moves -> moves_cleaned), 01_create_traces (its output is
-not read by later steps), 05_translate_clusters (GIS figures), and the trade and stay adjustments of 02 (switched off
-there: tradeAdjust = stayAttenuation = False).
+scripts/build_rules_utils.py, scripts/make_HONet_dic.py, in one file that needs only numpy. The notebooks were
+removed on 2026-11-17 and are in tag v1.0.0. Step 0 (00_sort_clean_moves) is hon_moves.py. Not converted:
+01_create_traces (its output is not read by later steps), 05_translate_clusters (GIS figures), and the trade and stay
+adjustments of 02 (switched off there: tradeAdjust = stayAttenuation = False).
 
     python Code/HON_Code/hon_sf.py run --moves data/moves/moves_cleaned_2018.txt \
         --places data/Places_allportdata_mergedSept2017.csv --port-country data/stay/portToCountry.csv \
